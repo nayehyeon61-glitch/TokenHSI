@@ -90,3 +90,13 @@ params:
 
     task_reward_w: 0.5
     disc_reward_w: 0.5
+
+    world_model:
+      enabled: True
+      horizon: 1
+      hidden_units: [512, 512]
+      activation: relu
+      learning_rate: 1.0e-4
+      updates_per_epoch: 1
+      batch_size: 16384
+      grad_clip_norm: null

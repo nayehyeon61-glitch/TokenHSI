@@ -42,7 +42,8 @@ import torch
 from torch import nn
 
 import learning.replay_buffer as replay_buffer
-import learning.common_agent as common_agent 
+import learning.common_agent as common_agent
+import learning.world_model as world_model
 
 from tensorboardX import SummaryWriter
 
@@ -58,6 +59,8 @@ class AMPAgent(common_agent.CommonAgent):
         if self._normalize_amp_input:
             # refer to CALM https://github.com/NVlabs/CALM
             self._amp_input_mean_std = RunningMeanStd((self._amp_observation_space.shape[0] // self.vec_env.env.task._num_amp_obs_steps,)).to(self.ppo_device)
+
+        self._init_world_model()
 
         return
 
@@ -82,14 +85,22 @@ class AMPAgent(common_agent.CommonAgent):
         state = super().get_stats_weights()
         if self._normalize_amp_input:
             state['amp_input_mean_std'] = self._amp_input_mean_std.state_dict()
-        
+
+        if self._train_world_model:
+            state['world_model'] = self.world_model.state_dict()
+            state['world_model_optimizer'] = self.world_model_optimizer.state_dict()
+
         return state
 
     def set_stats_weights(self, weights):
         super().set_stats_weights(weights)
         if self._normalize_amp_input:
             self._amp_input_mean_std.load_state_dict(weights['amp_input_mean_std'])
-        
+
+        if self._train_world_model:
+            self.world_model.load_state_dict(weights['world_model'])
+            self.world_model_optimizer.load_state_dict(weights['world_model_optimizer'])
+
         return
 
     def play_steps(self):
@@ -174,6 +185,93 @@ class AMPAgent(common_agent.CommonAgent):
             batch_dict[k] = a2c_common.swap_and_flatten01(v)
 
         return batch_dict
+
+    def _init_world_model(self):
+        cfg = self.config.get('world_model', {})
+        self._train_world_model = cfg.get('enabled', False)
+        if not self._train_world_model:
+            self.world_model = None
+            self.world_model_optimizer = None
+            self._world_model_updates_per_epoch = 0
+            self._world_model_batch_size = 0
+            self._world_model_grad_clip = None
+            self._world_model_horizon = 1
+            self._last_world_model_loss = None
+            return
+
+        self._world_model_horizon = int(cfg.get('horizon', 1))
+        if self._world_model_horizon != 1:
+            raise ValueError('The current world model implementation only supports horizon=1.')
+
+        obs_space = self.env_info['observation_space']
+        self._world_model_obs_dim = int(np.prod(obs_space.shape))
+        hidden_units = cfg.get('hidden_units', [512, 512]) or []
+        activation = cfg.get('activation', 'relu')
+
+        self.world_model = world_model.WorldModel(self._world_model_obs_dim, hidden_units, activation).to(self.ppo_device)
+        lr = float(cfg.get('learning_rate', 1e-4))
+        self.world_model_optimizer = optim.Adam(self.world_model.parameters(), lr)
+        self._world_model_updates_per_epoch = int(cfg.get('updates_per_epoch', 1))
+        self._world_model_batch_size = int(cfg.get('batch_size', self.minibatch_size))
+        self._world_model_grad_clip = cfg.get('grad_clip_norm', None)
+        self._last_world_model_loss = None
+
+    def _train_auxiliary_modules(self, batch_dict):
+        super()._train_auxiliary_modules(batch_dict)
+
+        if not self._train_world_model:
+            return
+
+        obses = batch_dict['obses']
+        next_obses = batch_dict['next_obses']
+        dones = batch_dict['dones']
+
+        if dones.dtype != torch.float32:
+            dones = dones.float()
+
+        batch_size = obses.shape[0]
+        if batch_size == 0:
+            return
+
+        obs_flat = obses.reshape(batch_size, -1)
+        next_obs_flat = next_obses.reshape(batch_size, -1)
+        mask = (1.0 - dones).reshape(batch_size, -1)
+        device = obs_flat.device
+
+        losses = []
+        updates = max(self._world_model_updates_per_epoch, 0)
+        self.world_model.train()
+        for _ in range(updates):
+            if self._world_model_batch_size >= batch_size:
+                indices = torch.arange(batch_size, device=device)
+            else:
+                indices = torch.randint(0, batch_size, (self._world_model_batch_size,), device=device)
+
+            obs_batch = obs_flat[indices]
+            next_obs_batch = next_obs_flat[indices]
+            mask_batch = mask[indices]
+
+            preds = self.world_model(obs_batch)
+            diff = preds - next_obs_batch
+            loss_matrix = diff * diff
+            valid = mask_batch.sum()
+            if valid.item() == 0:
+                continue
+            loss = (loss_matrix * mask_batch).sum() / valid
+
+            self.world_model_optimizer.zero_grad()
+            loss.backward()
+            if self._world_model_grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), self._world_model_grad_clip)
+            self.world_model_optimizer.step()
+
+            losses.append(loss.detach())
+
+        if losses:
+            mean_loss = torch.stack(losses).mean()
+            self._last_world_model_loss = mean_loss
+            if getattr(self, 'rank', 0) == 0:
+                self.writer.add_scalar('world_model/loss', mean_loss.item(), self.frame)
     
     def get_action_values(self, obs_dict, rand_action_probs):
         processed_obs = self._preproc_obs(obs_dict['obs'])

@@ -270,6 +270,8 @@ class CommonAgent(a2c_continuous.A2CAgent):
             self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
             self.update_lr(self.last_lr)
 
+        self._train_auxiliary_modules(batch_dict)
+
         update_time_end = time.time()
         play_time = play_time_end - play_time_start
         update_time = update_time_end - update_time_start
@@ -585,6 +587,9 @@ class CommonAgent(a2c_continuous.A2CAgent):
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         return advantages
+
+    def _train_auxiliary_modules(self, batch_dict):
+        return
 
     def _record_train_batch_info(self, batch_dict, train_info):
         return
